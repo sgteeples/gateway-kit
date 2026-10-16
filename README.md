@@ -87,6 +87,8 @@ curl -X POST localhost:8080/api/legacy/v1/data \
   -d '{"userId": 42, "userName": "ada"}'
 ```
 
+For a full walkthrough of every route, with success and failure cases and the expected output for each, see **[docs/MANUAL_TESTING.md](docs/MANUAL_TESTING.md)**.
+
 You can control the mock upstream with query parameters to simulate failures:
 
 | Parameter | Effect | Example |
