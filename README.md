@@ -46,7 +46,7 @@ go run ./cmd/gateway                                   # 4. defaults to ./gatewa
 
 With make: `make run CONFIG=path/to/config.yaml`.
 
-**An invalid config stops the gateway at startup** with a non-zero exit code. It lists every problem it found and where, for example:
+**An invalid config stops the gateway at startup** with a non-zero exit code. It lists every invalid value it found and where. A YAML syntax or type error, such as an unparseable duration or an unknown key, stops at that first error. For example:
 
 ```
 invalid config bad.yaml:
@@ -78,7 +78,8 @@ curl localhost:8080/api/products/123
 curl localhost:8080/api/internal
 curl -H 'X-API-Key: sk_live_abc123' localhost:8080/api/internal
 
-# Rate limiting: the 11th request inside 10s gets a 429
+# Rate limiting: the 11th request in the same 10-second window gets a 429
+# (windows are aligned to the clock, so a burst that crosses a boundary may get more through)
 for i in $(seq 11); do curl -s -o /dev/null -w '%{http_code} ' localhost:8080/api/orders; done
 
 # Request and response transforms: body mapping, header rules, response envelope

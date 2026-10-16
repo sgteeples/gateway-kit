@@ -26,6 +26,12 @@ Each tier had to be finished, tested and pushed before the next one started. Tha
 - Active health checks. They only change *which* target is chosen, and retries and the breaker already cope with a dead one.
 - Body transforms: request mapping and response envelope
 
+## Architecture
+
+- **The proxy pipeline:** each route is built once at startup as two decorator chains. An `http.Handler` chain holds policies that can reject a request early (auth, rate limit, request transforms). An `http.RoundTripper` chain holds policies that need the upstream's response (response transforms, circuit breaker, retry, load balancing). `proxy.Handler` bridges the two and is the single place errors become JSON responses.
+- **Extensibility:** adding a config feature means adding the field and its validation, writing one decorator, and wiring it into `buildRoute` with one line.
+- The diagram, and the reasoning behind the chain order, are in the [README's Architecture section](README.md#architecture).
+
 ## Key decisions
 
 | Question | Chosen | Alternative | Why |
@@ -68,6 +74,8 @@ Interpretations of the spec's ambiguous parts:
 - **On shutdown:** SIGTERM drains in-flight requests and stops the background goroutines.
 
 ## Known limitations
+
+No features are partially implemented: every config field is built and tested. These are the limits of the current implementation:
 
 1. **CONNECT and TRACE are forwarded** on routes with no `methods` list; they should get a 405. Go 1.27.2 also patches standard-library HTTP vulnerabilities, so the toolchain should be upgraded.
 2. **No streaming:** responses aren't flushed as they arrive (no SSE), WebSockets aren't supported, and envelope routes buffer the whole response.
