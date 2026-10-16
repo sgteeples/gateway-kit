@@ -14,6 +14,53 @@ The proxy logic is built by hand on the standard library's `net/http`, without `
 
 For the reasoning behind the design, including the priorities, trade-offs and ambiguous parts of the spec, see **[DECISIONS.md](DECISIONS.md)**.
 
+## Architecture
+
+```mermaid
+flowchart TB
+    client([Client]) --> edge
+
+    subgraph edge["Gateway-wide (every request)"]
+        direction LR
+        recover["recover<br/>panic → 500"] --> log["access log<br/>request ID, timing"] --> norm["path check<br/>ambiguous → 400"] --> health{"GET /health?"}
+        health -- no --> router["router<br/>404 / 405"]
+    end
+    health -- yes --> healthResp(["200 healthy"])
+
+    router --> handlers
+
+    subgraph handlers["Per route: client-facing chain (http.Handler)"]
+        direction LR
+        bodyTO["body read timeout<br/>408"] --> auth["auth<br/>401"] --> rl["rate limit<br/>429"] --> reqH["request headers"] --> reqB["request body mapping<br/>400"] --> proxy["proxy.Handler"]
+    end
+
+    proxy --> rts
+
+    subgraph rts["Per route: upstream-facing chain (http.RoundTripper)"]
+        direction LR
+        resH["response headers"] --> resB["response envelope"] --> cb["circuit breaker<br/>503"] --> retry["retry + backoff"] --> dispatch["Dispatch<br/>balancer + timeout<br/>502 / 504"]
+    end
+
+    dispatch --> transport["shared http.Transport"] --> upstreams[("Upstream targets")]
+
+    subgraph bg["Background (per route)"]
+        direction LR
+        hc["health checker"]
+        janitor["rate-limit janitor"]
+    end
+    hc -. probes .-> upstreams
+    hc -. marks healthy / unhealthy .-> dispatch
+    janitor -. evicts idle buckets .-> rl
+
+    config[/"gateway.yaml"/] -. "parse → validate → defaults → buildRoute (once, at startup)" .-> handlers
+```
+
+Each route's pipeline is built **once at startup** from the config, as two decorator chains:
+- **Client-facing (`http.Handler`):** policies that can reject a request before any upstream call.
+- **Upstream-facing (`http.RoundTripper`):** policies that need to see the upstream's response or error.
+
+`proxy.Handler` bridges the two and is the one place errors become JSON responses. The labels on each stage show the status it can return. Responses travel back up the same chain. [DECISIONS.md](DECISIONS.md#architecture) explains why the stages are in this order.
+
 ## Prerequisites
 
 - **Go 1.27 or newer** ([install](https://go.dev/dl/)).
