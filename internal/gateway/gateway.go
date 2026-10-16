@@ -58,9 +58,6 @@ func New(cfg *config.Config, logger *slog.Logger) (*Gateway, error) {
 			return nil, fmt.Errorf("route %s: %w", rc.Path, err)
 		}
 		routes = append(routes, router.Route{Path: rc.Path, Methods: rc.Methods, Handler: h})
-		for _, feature := range unimplemented(rc) {
-			logger.Warn("config feature is not implemented yet and will be ignored", "route", rc.Path, "feature", feature)
-		}
 	}
 
 	g.handler = g.recoverPanics(g.accessLog(g.withHealth(router.New(routes))))
@@ -90,15 +87,19 @@ func (g *Gateway) buildRoute(rc *config.Route) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	logger := g.logger.With("route", rc.Path)
+	if rc.HealthCheck != nil {
+		hc := upstream.NewHealthChecker(*rc.HealthCheck, targets, g.transport, rc.Upstream.Timeout.Std(), logger)
+		go hc.Run(g.ctx)
+	}
 
 	// Upstream-facing chain, built innermost first, so it runs:
-	// response transform -> circuit breaker -> retry -> Dispatch -> transport.
+	// response headers -> response body -> circuit breaker -> retry -> Dispatch -> transport.
 	var rt http.RoundTripper = &upstream.Dispatch{
 		Balancer: balancer,
 		Timeout:  rc.Upstream.Timeout.Std(),
 		Next:     g.transport,
 	}
-	logger := g.logger.With("route", rc.Path)
 	// Retry sits above Dispatch so each attempt re-picks a target and gets
 	// its own timeout.
 	if rc.Retry != nil {
@@ -109,18 +110,26 @@ func (g *Gateway) buildRoute(rc *config.Route) (http.Handler, error) {
 	if rc.CircuitBreaker != nil {
 		rt = upstream.NewBreaker(*rc.CircuitBreaker, rt, logger)
 	}
+	// Body before headers, so the config's header rules have the final say
+	// (e.g. over the Content-Type the envelope sets).
+	if t := rc.ResponseTransform; t != nil && t.Body != nil {
+		rt = transform.ResponseBody(t.Body, rc.Path, logger, rt)
+	}
 	if t := rc.ResponseTransform; t != nil && t.Headers != nil {
 		rt = transform.ResponseHeaders(t.Headers, rc.Path, rt)
 	}
 
 	// Client-facing chain, built innermost first, so it runs:
-	// auth -> rate limit -> request transform -> proxy.
+	// auth -> rate limit -> request headers -> request body -> proxy.
 	var h http.Handler = &proxy.Handler{
 		Transport:   rt,
 		StripPrefix: stripPrefix(rc),
 		// Retries must be able to re-send the body, so buffer it.
 		BufferBody: rc.Retry != nil,
 		Logger:     logger,
+	}
+	if t := rc.RequestTransform; t != nil && t.Body != nil {
+		h = transform.RequestBody(t.Body, rc.Path)(h)
 	}
 	if t := rc.RequestTransform; t != nil && t.Headers != nil {
 		h = transform.RequestHeaders(t.Headers, rc.Path)(h)
@@ -143,22 +152,6 @@ func stripPrefix(rc *config.Route) string {
 		return rc.Path
 	}
 	return ""
-}
-
-// unimplemented lists features present in the route config that this build
-// does not enforce, so they are reported at startup instead of silently ignored.
-func unimplemented(rc *config.Route) []string {
-	var out []string
-	if rc.HealthCheck != nil {
-		out = append(out, "health_check")
-	}
-	if t := rc.RequestTransform; t != nil && t.Body != nil {
-		out = append(out, "request_transform.body")
-	}
-	if t := rc.ResponseTransform; t != nil && t.Body != nil {
-		out = append(out, "response_transform.body")
-	}
-	return out
 }
 
 // newTransport is the single connection pool shared by every route.

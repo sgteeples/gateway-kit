@@ -6,7 +6,6 @@ package proxy
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,9 +15,6 @@ import (
 	"github.com/sgteeples/gateway-kit/internal/httperr"
 	"github.com/sgteeples/gateway-kit/internal/netx"
 )
-
-// DefaultMaxBodyBytes caps request bodies the gateway has to buffer.
-const DefaultMaxBodyBytes = 10 << 20
 
 // Handler forwards requests for one route.
 type Handler struct {
@@ -79,7 +75,7 @@ func (h *Handler) outboundRequest(r *http.Request) (*http.Request, error) {
 
 	var body io.Reader = r.Body
 	if h.BufferBody {
-		buf, err := readBody(r.Body, h.maxBodyBytes())
+		buf, err := netx.ReadLimited(r.Body, h.maxBodyBytes())
 		if err != nil {
 			return nil, err
 		}
@@ -109,18 +105,7 @@ func (h *Handler) maxBodyBytes() int64 {
 	if h.MaxBodyBytes > 0 {
 		return h.MaxBodyBytes
 	}
-	return DefaultMaxBodyBytes
-}
-
-func readBody(body io.Reader, limit int64) ([]byte, error) {
-	buf, err := io.ReadAll(io.LimitReader(body, limit+1))
-	if err != nil {
-		return nil, &httperr.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "could not read request body", Err: err}
-	}
-	if int64(len(buf)) > limit {
-		return nil, &httperr.Error{Status: http.StatusRequestEntityTooLarge, Code: "payload_too_large", Err: errors.New("request body over limit")}
-	}
-	return buf, nil
+	return netx.MaxBodyBytes
 }
 
 // stripPrefix removes a route prefix: /api/products/123 -> /123, and the bare

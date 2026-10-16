@@ -192,6 +192,7 @@ func (v *validator) transform(field string, t *Transform) {
 		}
 	}
 	if b := t.Body; b != nil {
+		v.mappingConflicts(field+".body.mapping", b.Mapping)
 		for dest, src := range b.Mapping {
 			if dest == "" || src == "" {
 				v.add(field+".body.mapping", "empty key or value in %q: %q", dest, src)
@@ -199,6 +200,21 @@ func (v *validator) transform(field string, t *Transform) {
 			v.variable(field+".body.mapping."+dest, src)
 		}
 		v.envelope(field+".body.envelope", b.Envelope)
+	}
+}
+
+// mappingConflicts rejects destinations where one is a parent of another
+// ("user" and "user.id"): the result would depend on map iteration order.
+func (v *validator) mappingConflicts(field string, mapping map[string]string) {
+	dests := make([]string, 0, len(mapping))
+	for dest := range mapping {
+		dests = append(dests, dest)
+	}
+	slices.Sort(dests)
+	for i := 1; i < len(dests); i++ {
+		if strings.HasPrefix(dests[i], dests[i-1]+".") {
+			v.add(field, "destinations %q and %q conflict: one is inside the other", dests[i-1], dests[i])
+		}
 	}
 }
 

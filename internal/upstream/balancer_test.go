@@ -59,3 +59,40 @@ func TestUnknownBalanceStrategy(t *testing.T) {
 		t.Error("expected an error for an unknown strategy")
 	}
 }
+
+func TestBalancersSkipUnhealthyTargets(t *testing.T) {
+	for _, strategy := range []string{config.BalanceRoundRobin, config.BalanceWeightedRoundRobin} {
+		t.Run(strategy, func(t *testing.T) {
+			ts := targets(t, 3, 1, 1)
+			b, _ := NewBalancer(strategy, ts)
+			ts[0].SetHealthy(false)
+			if got := sequence(t, b, 6); strings.Contains(got, "a") {
+				t.Errorf("sequence = %s; unhealthy target a was picked", got)
+			}
+		})
+	}
+}
+
+func TestWeightsHoldAmongHealthyTargets(t *testing.T) {
+	ts := targets(t, 1, 3, 1)
+	b, _ := NewBalancer(config.BalanceWeightedRoundRobin, ts)
+	ts[2].SetHealthy(false)
+	got := sequence(t, b, 8)
+	if strings.Count(got, "b") != 6 || strings.Count(got, "a") != 2 {
+		t.Errorf("sequence = %s, want b:a = 3:1 with c excluded", got)
+	}
+}
+
+func TestBalancersFailOpenWhenAllUnhealthy(t *testing.T) {
+	for _, strategy := range []string{config.BalanceRoundRobin, config.BalanceWeightedRoundRobin} {
+		t.Run(strategy, func(t *testing.T) {
+			ts := targets(t, 1, 1)
+			b, _ := NewBalancer(strategy, ts)
+			ts[0].SetHealthy(false)
+			ts[1].SetHealthy(false)
+			if got := sequence(t, b, 4); got != "abab" {
+				t.Errorf("sequence = %s; with every target down, traffic should still go to all", got)
+			}
+		})
+	}
+}

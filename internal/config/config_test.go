@@ -105,6 +105,7 @@ routes:
 		{"zero window", `routes: [{path: "/x", upstream: {url: "http://h"}, rate_limit: {requests: 1}}]`, "rate_limit.window: is required"},
 		{"bad retry code", `routes: [{path: "/x", upstream: {url: "http://h"}, retry: {attempts: 2, on: [700]}}]`, "not an HTTP status code: 700"},
 		{"auth without keys", `routes: [{path: "/x", upstream: {url: "http://h"}, auth: {type: api_key, header: X-Key}}]`, "at least one key is required"},
+		{"conflicting mapping", `routes: [{path: "/x", upstream: {url: "http://h"}, request_transform: {body: {mapping: {user: a, user.id: b}}}}]`, `"user" and "user.id" conflict`},
 		{"unknown variable", `routes: [{path: "/x", upstream: {url: "http://h"}, request_transform: {headers: {add: {X-T: "$request_tme"}}}}]`, `unknown variable "$request_tme"`},
 	}
 	for _, tt := range tests {

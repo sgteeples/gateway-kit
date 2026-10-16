@@ -24,8 +24,9 @@ Config path resolution: `-config` flag, then the first positional arg, then `$GA
 
 Each route's pipeline is built **once at startup** by `internal/gateway.buildRoute`, as two decorator chains:
 
-- **Client-facing `http.Handler` chain:** policies that can reject a request before any upstream call (auth, rate limiting, request transforms). It ends in `proxy.Handler`.
-- **Upstream-facing `http.RoundTripper` chain:** policies that must see the upstream response or error (response transform → circuit breaker → retry → `upstream.Dispatch` → shared `http.Transport`). These never write to the client.
+- **Client-facing `http.Handler` chain:** policies that can reject or rewrite a request before any upstream call (auth → rate limit → request headers → request body). It ends in `proxy.Handler`.
+- **Upstream-facing `http.RoundTripper` chain:** policies that must see the upstream response or error (response headers → response body → circuit breaker → retry → `upstream.Dispatch` → shared `http.Transport`). These never write to the client.
+- **Background work:** one `upstream.HealthChecker` per route that has a `health_check`. It flips each `Target`'s atomic healthy flag, and the balancers read that flag. Rate-limit janitors also run in the background. All of it stops when `Gateway.Close()` cancels `g.ctx`.
 
 `proxy.Handler` is the bridge between the two. It builds the outbound request with only the path and query set. `upstream.Dispatch` then picks a target from the `Balancer`, sets the scheme and host, and applies the per-attempt route timeout. Dispatch sits *below* retry, so each attempt can go to a different target and gets its own timeout.
 
@@ -42,8 +43,7 @@ Downstream code never has to handle unset values.
 1. Add the field to `internal/config/config.go`.
 2. Add validation in `validate.go` and defaults in `defaults.go`.
 3. Write the decorator in the matching package.
-4. Wire it into `buildRoute`.
-5. Remove it from `unimplemented()` in `gateway.go`. That list makes configured-but-unbuilt features log a warning at startup instead of being silently ignored.
+4. Wire it into `buildRoute`, at the right position in the chain. The order is documented inline there and in `DECISIONS.md`.
 
 `/health` is handled before routing and always wins. Request paths are cleaned (`.` and `..` resolved) before routing, so they can't bypass a route's policies.
 

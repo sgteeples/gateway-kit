@@ -11,7 +11,7 @@ Work is ordered in tiers, with one commit per tier, so the history shows the ord
 | 0 | Config loading and validation, `/health`, routing (404/405), hand-written proxying, timeouts, `strip_prefix`, load balancing | The spec's non-negotiable requirements. Everything else plugs into this pipeline. Weighted round robin landed here because the example config uses it and the gateway has to boot on that file. |
 | 1 | Rate limiting, API key auth, header transforms | Rate limiting under concurrency is called out by name in the grading. Auth and header transforms are cheap and show the pipeline is easy to extend. |
 | 2 | Circuit breaker, retries | Resilience: what happens when an upstream is down or flaky. Tiers 0–1 answer it with a clean 502/504, but keep sending traffic to a dead upstream and give up on the first transient error. |
-| 3 | Active health checks, body transforms | The most code and the most ambiguity for the least core value. |
+| 3 | Active health checks, body transforms | The most code and the most ambiguity for the least core value. Health checks only change *which* target is picked, and retry and the breaker already cope with a dead one. After this tier, every feature in the schema is implemented. |
 
 ## Architecture
 
@@ -19,9 +19,11 @@ Each route's pipeline is built **once at startup** as two decorator chains:
 
 ```
 client → recover → access log (request id, request time, path cleaning) → /health → router (404/405)
-  → auth → rate limit → request header transform → proxy.Handler                       [http.Handler chain]
-      → response header transform → circuit breaker → retry → Dispatch (balancer + per-attempt timeout)
-      → shared http.Transport                                                           [http.RoundTripper chain]
+  → auth → rate limit → request headers → request body → proxy.Handler                [http.Handler chain]
+      → response headers → response body → circuit breaker → retry
+      → Dispatch (health-aware balancer + per-attempt timeout) → shared http.Transport  [http.RoundTripper chain]
+
+background, per route with health_check:  HealthChecker ──probes──► targets ──healthy flag──► balancer
 ```
 
 - **Client-facing policies are `http.Handler` middleware.** These are policies that can reject a request before any upstream work is done.
@@ -31,7 +33,7 @@ client → recover → access log (request id, request time, path cleaning) → 
   - **Retry sits above `Dispatch`.** Each attempt picks a target again, so a retry can fail over to a healthy one, and each attempt gets its own timeout.
 - **`proxy.Handler` is the only bridge between the two chains**, and the only place where an error becomes a client response (through `httperr`). Every error has the same JSON shape: `{"error", "message", "retry_after"}`.
 - **Adding a config feature** is a struct field, validation, one decorator, and one line in `buildRoute`.
-- **Unbuilt features are reported, not hidden.** A feature that is configured but not implemented logs a warning at startup instead of being silently ignored.
+- **Unbuilt features were reported, not hidden.** During development, a configured but unbuilt feature logged a startup warning instead of being silently ignored. Each tier removed its entries, and the mechanism was deleted once every feature was built.
 
 ## Decisions and trade-offs
 
@@ -117,15 +119,63 @@ client → recover → access log (request id, request time, path cleaning) → 
 
 We chose **(a)**. Whoever wrote the config turned on retries for that route explicitly, and a gateway that quietly overrides its config is harder to reason about than one that does exactly what it was told. The risk sits with the config: enabling `retry` on a route amounts to saying its upstream is idempotent. The proper fix is end-to-end `Idempotency-Key` support (pass a client key through, or generate one per request and reuse it on every retry) so the upstream can drop duplicates. That's listed under next steps.
 
+**Active health checks**
+- **Schedule:** one checker per route. It probes every target concurrently, once at startup and then every `interval`, with `GET <target><path>`. Only 2xx counts as healthy.
+- **Probe timeout:** the shorter of the route timeout and the interval, so probes can't pile up.
+- **Probes bypass the client policies.** They go straight to the transport, skipping auth, transforms, retry and the breaker.
+- **State changes:**
+  - `unhealthy_threshold` **consecutive** failures mark a target unhealthy; a success in between resets the streak.
+  - **One** success marks it healthy again. The spec only defines the unhealthy side; a `healthy_threshold` would be the next refinement.
+- **Targets start healthy,** so the route serves traffic during boot. A dead target is therefore only marked down after `threshold × interval`, which is 90s for the example config. Retry and the breaker cover that gap reactively.
+- **The balancers skip unhealthy targets.** Smooth WRR runs over the healthy targets only, so the configured ratio still holds among the ones that are up.
+- **State changes are logged.** Checkers stop on `Gateway.Close()`.
+
+**Body transforms**
+- **One code path for both directions.** `mapping` and `envelope` are applied mapping first, then envelope, the same way on both sides. The config uses mapping on requests and envelope on responses, but either works on both.
+- **Mapping:**
+  - Source dot paths are read from the JSON body and keep their type (`42` stays a number).
+  - Numbers are decoded with `UseNumber`, so large integers keep full precision.
+  - A missing source field is left out, not written as `null`.
+  - `$request_time` in the body is the same instant as in the `X-Request-Start` header, because it is captured once at the edge.
+- **Request bodies:**
+  - No body (GET) → untouched.
+  - A non-JSON `Content-Type` → forwarded untouched.
+  - A body that declares JSON but doesn't parse → **400 `invalid_json`**. That's better than forwarding a body the upstream would choke on.
+- **Conflicting destinations fail validation.** `user` alongside `user.id` is rejected, because the result would depend on map iteration order.
+- **Envelope:**
+  - `$body` holds the parsed upstream JSON. A non-JSON body becomes a string and an empty one becomes `null`.
+  - Output is JSON with a corrected `Content-Length`. `ETag` and `Content-MD5` are dropped because they no longer match.
+  - 204, 304 and HEAD responses are left alone.
+- **Compression:** envelope routes don't forward the client's `Accept-Encoding`. Go's transport then requests gzip itself and decompresses it transparently, so the gateway always parses plain bytes. This is tested against a gzip-only upstream.
+- **Response header rules run after the envelope,** so they have the final say over headers such as the `Content-Type` the envelope sets.
+- **Trade-off: envelope routes give up streaming**, because the whole body has to be read first. Bodies over 10 MB pass through unwrapped, with a warning, rather than consuming unbounded memory.
+- **Known limitation:** Go's `encoding/json` writes object keys alphabetically, so envelope keys don't keep their order from the config. JSON objects are unordered, so clients shouldn't rely on it.
+
+### Decisions: three Tier 3 judgment calls
+
+Each of these was presented with alternatives, and **(a)** was chosen every time.
+
+1. **When every target is unhealthy → fail open.** ✅ Chosen.
+   - The balancer keeps sending to all targets, and the checker logs one warning.
+   - **Why:** a misconfigured health path, or a blip in the health endpoints themselves, shouldn't take down a route whose upstreams may be fine. Envoy's "panic threshold" works the same way.
+   - **Rejected alternative:** (b) fail closed with `503 no_healthy_upstream`.
+2. **What mapping outputs → only the mapped fields.** ✅ Chosen.
+   - **Why:** "restructure" implies the upstream expects the new shape. Keeping unmapped fields would send `userId` and `user.id` side by side, and could leak fields the legacy service shouldn't see.
+   - **Rejected alternative:** (b) merge the mapped fields into the original body.
+3. **Which responses to envelope → every upstream response, status preserved.** ✅ Chosen.
+   - **Why:** clients of an enveloped route always get one shape, including upstream 4xx and 5xx responses. The gateway's own errors (429, 502, 503, ...) are never wrapped. That matches the header-transform rule and keeps one error format across the gateway.
+   - **Rejected alternative:** (b) envelope only 2xx responses.
+
 ## Partially implemented / not yet built
 
-- Active health checks and body transforms (mapping and envelope). Each logs a startup warning when configured.
+Every feature in the config schema is implemented. The open edges are documented in the sections above and listed below.
 
 ## With more time
 
 - Flush streamed responses (SSE) as they arrive. Support WebSocket/Upgrade proxying.
 - Trusted-proxy configuration for `X-Forwarded-For`.
 - `Idempotency-Key` support so POST retries are safe. Retry jitter. Honoring upstream `Retry-After`. An overall per-request deadline across retries.
-- Per-target circuit breakers on load-balanced routes.
+- Per-target circuit breakers on load-balanced routes. Passive health checks, where real traffic failures feed target health. A `healthy_threshold` for recovery.
+- Streaming body transforms, for large payloads, instead of buffering.
 - Hot reload of the config on SIGHUP.
 - Metrics (per-route latency, status counts, limiter rejections).
