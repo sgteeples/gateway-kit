@@ -48,7 +48,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		e := httperr.From(err)
-		h.Logger.Warn("upstream request failed", "path", r.URL.Path, "status", e.Status, "err", err)
+		if e.Err != nil {
+			// A real upstream failure. Policy rejections (e.g. an open
+			// circuit breaker) never reached the upstream and are logged
+			// by the access log alone.
+			h.Logger.Warn("upstream request failed", "path", r.URL.Path, "status", e.Status, "err", err)
+		}
 		httperr.Write(w, e)
 		return
 	}

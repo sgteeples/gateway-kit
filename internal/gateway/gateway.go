@@ -91,12 +91,23 @@ func (g *Gateway) buildRoute(rc *config.Route) (http.Handler, error) {
 		return nil, err
 	}
 
-	// Upstream-facing chain, built innermost first:
-	// response transform -> Dispatch -> shared transport.
+	// Upstream-facing chain, built innermost first, so it runs:
+	// response transform -> circuit breaker -> retry -> Dispatch -> transport.
 	var rt http.RoundTripper = &upstream.Dispatch{
 		Balancer: balancer,
 		Timeout:  rc.Upstream.Timeout.Std(),
 		Next:     g.transport,
+	}
+	logger := g.logger.With("route", rc.Path)
+	// Retry sits above Dispatch so each attempt re-picks a target and gets
+	// its own timeout.
+	if rc.Retry != nil {
+		rt = upstream.NewRetry(*rc.Retry, rt, logger)
+	}
+	// The breaker sits above retry: one client request counts as at most one
+	// failure, and an open breaker rejects without spending time on retries.
+	if rc.CircuitBreaker != nil {
+		rt = upstream.NewBreaker(*rc.CircuitBreaker, rt, logger)
 	}
 	if t := rc.ResponseTransform; t != nil && t.Headers != nil {
 		rt = transform.ResponseHeaders(t.Headers, rc.Path, rt)
@@ -107,7 +118,9 @@ func (g *Gateway) buildRoute(rc *config.Route) (http.Handler, error) {
 	var h http.Handler = &proxy.Handler{
 		Transport:   rt,
 		StripPrefix: stripPrefix(rc),
-		Logger:      g.logger.With("route", rc.Path),
+		// Retries must be able to re-send the body, so buffer it.
+		BufferBody: rc.Retry != nil,
+		Logger:     logger,
 	}
 	if t := rc.RequestTransform; t != nil && t.Headers != nil {
 		h = transform.RequestHeaders(t.Headers, rc.Path)(h)
@@ -122,7 +135,7 @@ func (g *Gateway) buildRoute(rc *config.Route) (http.Handler, error) {
 	if a := rc.Auth; a != nil {
 		h = middleware.APIKey(a.Header, a.Keys)(h)
 	}
-	return h, nil
+	return tagRoute(rc.Path, h), nil
 }
 
 func stripPrefix(rc *config.Route) string {
@@ -136,12 +149,6 @@ func stripPrefix(rc *config.Route) string {
 // does not enforce, so they are reported at startup instead of silently ignored.
 func unimplemented(rc *config.Route) []string {
 	var out []string
-	if rc.Retry != nil {
-		out = append(out, "retry")
-	}
-	if rc.CircuitBreaker != nil {
-		out = append(out, "circuit_breaker")
-	}
 	if rc.HealthCheck != nil {
 		out = append(out, "health_check")
 	}

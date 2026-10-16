@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -50,15 +51,32 @@ func (g *Gateway) accessLog(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", id)
 
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
+		matched := &matchedRoute{}
+		next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), matchedRouteKey{}, matched)))
 
 		g.logger.Info("request",
 			"id", id,
 			"method", r.Method,
 			"path", r.URL.Path,
+			"route", matched.path,
 			"status", rec.status,
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
+	})
+}
+
+type matchedRouteKey struct{}
+
+// matchedRoute is filled in by the route's handler so the access log, which
+// runs outside the router, can say which route served the request.
+type matchedRoute struct{ path string }
+
+func tagRoute(path string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if m, ok := r.Context().Value(matchedRouteKey{}).(*matchedRoute); ok {
+			m.path = path
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

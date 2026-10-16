@@ -73,6 +73,7 @@ func run(logger *slog.Logger) error {
 	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("shutdown: %w", err)
 	}
+	logger.Info("gateway stopped")
 	return nil
 }
 
