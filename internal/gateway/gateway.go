@@ -10,6 +10,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -18,8 +19,11 @@ import (
 
 	"github.com/sgteeples/gateway-kit/internal/config"
 	"github.com/sgteeples/gateway-kit/internal/httperr"
+	"github.com/sgteeples/gateway-kit/internal/middleware"
 	"github.com/sgteeples/gateway-kit/internal/proxy"
+	"github.com/sgteeples/gateway-kit/internal/ratelimit"
 	"github.com/sgteeples/gateway-kit/internal/router"
+	"github.com/sgteeples/gateway-kit/internal/transform"
 	"github.com/sgteeples/gateway-kit/internal/upstream"
 )
 
@@ -29,7 +33,10 @@ type Gateway struct {
 	started   time.Time
 	logger    *slog.Logger
 	transport *http.Transport
-	closers   []func()
+
+	// ctx is cancelled by Close to stop background goroutines.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // New builds a gateway from a validated config. Call Close when done to stop
@@ -40,6 +47,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Gateway, error) {
 		logger:    logger,
 		transport: newTransport(),
 	}
+	g.ctx, g.cancel = context.WithCancel(context.Background())
 
 	routes := make([]router.Route, 0, len(cfg.Routes))
 	for i := range cfg.Routes {
@@ -65,9 +73,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Close stops background goroutines and releases idle upstream connections.
 func (g *Gateway) Close() {
-	for _, c := range g.closers {
-		c()
-	}
+	g.cancel()
 	g.transport.CloseIdleConnections()
 }
 
@@ -85,18 +91,36 @@ func (g *Gateway) buildRoute(rc *config.Route) (http.Handler, error) {
 		return nil, err
 	}
 
-	// Upstream-facing chain, innermost first.
+	// Upstream-facing chain, built innermost first:
+	// response transform -> Dispatch -> shared transport.
 	var rt http.RoundTripper = &upstream.Dispatch{
 		Balancer: balancer,
 		Timeout:  rc.Upstream.Timeout.Std(),
 		Next:     g.transport,
 	}
+	if t := rc.ResponseTransform; t != nil && t.Headers != nil {
+		rt = transform.ResponseHeaders(t.Headers, rc.Path, rt)
+	}
 
-	// Client-facing chain, innermost first.
+	// Client-facing chain, built innermost first, so it runs:
+	// auth -> rate limit -> request transform -> proxy.
 	var h http.Handler = &proxy.Handler{
 		Transport:   rt,
 		StripPrefix: stripPrefix(rc),
 		Logger:      g.logger.With("route", rc.Path),
+	}
+	if t := rc.RequestTransform; t != nil && t.Headers != nil {
+		h = transform.RequestHeaders(t.Headers, rc.Path)(h)
+	}
+	if rl := rc.RateLimit; rl != nil {
+		limiter := ratelimit.New(*rl, time.Now)
+		go limiter.RunJanitor(g.ctx)
+		h = middleware.RateLimit(limiter, rl.Per)(h)
+	}
+	// Auth runs before rate limiting so unauthenticated traffic can't use up
+	// a `per: global` quota meant for real callers.
+	if a := rc.Auth; a != nil {
+		h = middleware.APIKey(a.Header, a.Keys)(h)
 	}
 	return h, nil
 }
@@ -112,12 +136,6 @@ func stripPrefix(rc *config.Route) string {
 // does not enforce, so they are reported at startup instead of silently ignored.
 func unimplemented(rc *config.Route) []string {
 	var out []string
-	if rc.RateLimit != nil {
-		out = append(out, "rate_limit")
-	}
-	if rc.Auth != nil {
-		out = append(out, "auth")
-	}
 	if rc.Retry != nil {
 		out = append(out, "retry")
 	}
@@ -127,11 +145,11 @@ func unimplemented(rc *config.Route) []string {
 	if rc.HealthCheck != nil {
 		out = append(out, "health_check")
 	}
-	if rc.RequestTransform != nil {
-		out = append(out, "request_transform")
+	if t := rc.RequestTransform; t != nil && t.Body != nil {
+		out = append(out, "request_transform.body")
 	}
-	if rc.ResponseTransform != nil {
-		out = append(out, "response_transform")
+	if t := rc.ResponseTransform; t != nil && t.Body != nil {
+		out = append(out, "response_transform.body")
 	}
 	return out
 }

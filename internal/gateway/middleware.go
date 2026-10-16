@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sgteeples/gateway-kit/internal/httperr"
+	"github.com/sgteeples/gateway-kit/internal/transform"
 )
 
 // recoverPanics turns a panic in any route into a 500 instead of a dropped
@@ -34,6 +35,7 @@ func (g *Gateway) recoverPanics(next http.Handler) http.Handler {
 func (g *Gateway) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		r = r.WithContext(transform.WithRequestTime(r.Context(), start))
 
 		// Resolve "." and ".." before routing, so "/api/public/../internal"
 		// is matched (and authorized) as "/api/internal".
