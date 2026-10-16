@@ -125,27 +125,58 @@ func isJSON(contentType string) bool {
 }
 
 // RequestBody rewrites JSON request bodies before they are forwarded.
-// Requests with no body, or with a non-JSON Content-Type, pass through
-// untouched. A body that claims to be JSON but doesn't parse gets 400 rather
-// than being forwarded in a shape the upstream won't expect.
+//
+// The body is judged by its content, not only its Content-Type: clients often
+// send JSON without the header (curl -d defaults to a form type), and silently
+// skipping the transform would forward the wrong shape. So:
+//
+//   - declared JSON: must parse, else 400 (rather than forward a body the
+//     upstream will choke on); too large is 413
+//   - not declared JSON: transformed only if it parses as a JSON object;
+//     anything else (forms, text, binary, bodies over the size cap) passes
+//     through unchanged, so non-JSON traffic on the route still works
+//   - no body: untouched
 func RequestBody(t *config.BodyTransform, routePath string) func(http.Handler) http.Handler {
 	b := newBody(t)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.ContentLength == 0 || !isJSON(r.Header.Get("Content-Type")) {
+			if r.ContentLength == 0 || r.Body == nil || r.Body == http.NoBody {
 				next.ServeHTTP(w, r)
 				return
 			}
-			raw, err := netx.ReadLimited(r.Body, netx.MaxBodyBytes)
+			declared := isJSON(r.Header.Get("Content-Type"))
+
+			raw, err := io.ReadAll(io.LimitReader(r.Body, netx.MaxBodyBytes+1))
 			if err != nil {
-				httperr.Write(w, httperr.From(err))
+				httperr.Write(w, &httperr.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "could not read request body", Err: err})
 				return
 			}
+			if len(raw) > netx.MaxBodyBytes {
+				if declared {
+					httperr.Write(w, &httperr.Error{Status: http.StatusRequestEntityTooLarge, Code: "payload_too_large", Message: "JSON body too large to transform"})
+					return
+				}
+				// Too big to be a body we'd transform: stream it on unchanged.
+				r.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.MultiReader(bytes.NewReader(raw), r.Body), r.Body}
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			parsed, err := decodeJSON(raw)
-			if err != nil {
+			_, isObject := parsed.(map[string]any)
+			switch {
+			case declared && err != nil:
 				httperr.Write(w, &httperr.Error{Status: http.StatusBadRequest, Code: "invalid_json", Message: "request body is not valid JSON", Err: err})
 				return
+			case !declared && (err != nil || !isObject):
+				r.Body = io.NopCloser(bytes.NewReader(raw)) // not JSON: forward as received
+				next.ServeHTTP(w, r)
+				return
 			}
+
 			out, err := json.Marshal(b.apply(parsed, Vars{RequestTime: RequestTime(r.Context()), RoutePath: routePath}))
 			if err != nil {
 				httperr.Write(w, &httperr.Error{Status: http.StatusInternalServerError, Code: "internal_error", Err: err})
@@ -154,6 +185,8 @@ func RequestBody(t *config.BodyTransform, routePath string) func(http.Handler) h
 			r.Body = io.NopCloser(bytes.NewReader(out))
 			r.ContentLength = int64(len(out))
 			r.Header.Del("Content-Length")
+			// The upstream now receives JSON whatever the client labelled it.
+			r.Header.Set("Content-Type", "application/json")
 			next.ServeHTTP(w, r)
 		})
 	}

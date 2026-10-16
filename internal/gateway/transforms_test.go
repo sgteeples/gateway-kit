@@ -126,6 +126,44 @@ func TestRequestMappingPassThrough(t *testing.T) {
 	wantStatus(t, h.get("/api/legacy/x"), http.StatusOK)
 }
 
+func TestRequestMappingWithoutJSONContentType(t *testing.T) {
+	_, up := newUpstream(t, "legacy")
+	h := newHarness(t, legacyRoute, up)
+
+	// What `curl -d '{...}'` sends: JSON labelled as a form. And no header at all.
+	for _, ct := range []string{"application/x-www-form-urlencoded", ""} {
+		t.Run("content-type="+ct, func(t *testing.T) {
+			hdr := http.Header{}
+			if ct != "" {
+				hdr.Set("Content-Type", ct)
+			}
+			resp := h.do("POST", "/api/legacy/x", strings.NewReader(`{"userId": 7, "userName": "grace"}`), hdr)
+			wantStatus(t, resp, http.StatusOK)
+			echo := decode[enveloped](t, resp).Data
+
+			var sent struct {
+				User struct {
+					ID   int    `json:"id"`
+					Name string `json:"name"`
+				} `json:"user"`
+			}
+			if err := json.Unmarshal(echo.Body, &sent); err != nil || sent.User.ID != 7 || sent.User.Name != "grace" {
+				t.Errorf("body was not mapped: %s", echo.Body)
+			}
+			if got := http.Header(echo.Headers).Get("Content-Type"); got != "application/json" {
+				t.Errorf("upstream Content-Type = %q, want application/json", got)
+			}
+		})
+	}
+
+	// JSON that isn't an object (here a bare number) is not a mapping source.
+	resp := h.do("POST", "/api/legacy/x", strings.NewReader(`42`), http.Header{"Content-Type": {"text/plain"}})
+	wantStatus(t, resp, http.StatusOK)
+	if got := string(decode[enveloped](t, resp).Data.Body); got != "42" {
+		t.Errorf("non-object body should pass through unchanged, upstream got %s", got)
+	}
+}
+
 func TestRequestMappingRejectsInvalidJSON(t *testing.T) {
 	up, upURL := newUpstream(t, "legacy")
 	h := newHarness(t, legacyRoute, upURL)
