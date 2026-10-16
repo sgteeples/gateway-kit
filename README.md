@@ -203,7 +203,14 @@ Each route's pipeline is built **once at startup** from the config, as two decor
 - **Client-facing (`http.Handler`):** policies that can reject a request before any upstream call.
 - **Upstream-facing (`http.RoundTripper`):** policies that need to see the upstream's response or error.
 
-`proxy.Handler` bridges the two and is the one place errors become JSON responses. The labels on each stage show the status it can return. Responses travel back up the same chain. [DECISIONS.md](DECISIONS.md#architecture) explains why the stages are in this order.
+`proxy.Handler` bridges the two and is the one place errors become JSON responses. The labels on each stage show the status it can return. Responses travel back up the same chain.
+
+The order is deliberate:
+- **The breaker sits above retry.** One client request counts as at most one failure, and an open breaker never waits on retries.
+- **Retry sits above Dispatch.** Each attempt picks a target again, so it can fail over, and each attempt gets its own timeout.
+- **Auth runs before the rate limit,** so unauthenticated traffic can't use up a shared quota.
+
+**Adding a feature** takes four steps: add the config field, add its validation, write one decorator, and wire it into `buildRoute` with one line.
 
 ## Project layout
 

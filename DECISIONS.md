@@ -26,25 +26,6 @@ Each tier had to be finished, tested and pushed before the next one started. Tha
 - Active health checks. They only change *which* target is chosen, and retries and the breaker already cope with a dead one.
 - Body transforms: request mapping and response envelope
 
-## Architecture
-
-```
-client → recover → access log → /health → router (404/405)
-  → auth → rate limit → request headers → request body → proxy.Handler     [http.Handler chain]
-      → response headers → response body → circuit breaker → retry
-      → Dispatch (load balancer + per-attempt timeout) → http.Transport      [http.RoundTripper chain]
-```
-
-- **Each route's pipeline is built once, at startup, as two decorator chains.**
-  - Policies that can reject a request *before* the upstream is called are `http.Handler` middleware.
-  - Policies that need the upstream's *response* are `http.RoundTripper` decorators. They never write to the client, and each can be unit-tested with a fake transport.
-- **The order of the chain is deliberate.**
-  - The breaker sits above retry, so one client request counts as at most one failure, and an open breaker never waits on retries.
-  - Retry sits above Dispatch, so each attempt picks a target again and gets its own timeout.
-- **There is one error path.** Every layer returns a typed `httperr.Error`, and `proxy.Handler` alone turns it into the JSON response.
-- **Config is strict.** Unknown keys are rejected. Validation collects every problem with its field path, then defaults are applied, so the rest of the code never has to handle "unset".
-- **Adding a feature** means four steps: add the config field, add its validation, write one decorator, and wire it into `buildRoute` with one line.
-
 ## Key decisions
 
 | Question | Chosen | Alternative | Why |
@@ -88,17 +69,9 @@ Interpretations of the spec's ambiguous parts:
 
 ## Known limitations
 
-- **Streaming:** responses aren't flushed as they arrive (no SSE), and WebSockets aren't supported. Envelope routes buffer the whole response.
-- **Approximations:** the sliding window is an approximation. Envelope keys come out alphabetically, because Go's JSON encoder sorts them.
-- **Detection delays:** a dead target is only marked unhealthy after `threshold × interval`, which is 90s in the example. Retries and the breaker cover that gap.
-- **Breaker scope:** there is one circuit breaker per route, not per target.
-- **No overall deadline across retries:** `/api/orders` can take up to about 18s in the worst case.
-- **Code-review findings not fixed yet:**
-  - **CONNECT and TRACE:** they are forwarded on routes with no `methods` list; they should get a 405. Go 1.27.2 also patches standard-library HTTP vulnerabilities.
-  - **Failed logins aren't rate limited:** auth runs first, so with `per: ip` key guessing is unthrottled.
-  - **No overall memory limit for buffered bodies:** each one is capped at 10 MB, but nothing limits the total across concurrent requests.
-  - **Logging gaps:** a client that disconnects is logged as 200, and the upstream-failure warning has no request ID.
-  - **Shutdown:** the 15s grace period is shorter than the longest route timeout, and `Close` doesn't wait for background goroutines to finish.
+1. **CONNECT and TRACE are forwarded** on routes with no `methods` list; they should get a 405. Go 1.27.2 also patches standard-library HTTP vulnerabilities, so the toolchain should be upgraded.
+2. **No streaming:** responses aren't flushed as they arrive (no SSE), WebSockets aren't supported, and envelope routes buffer the whole response.
+3. **Failed logins aren't rate limited:** auth runs before the rate limiter, so with `per: ip`, key guessing is unthrottled.
 
 ## What I'd build next
 
