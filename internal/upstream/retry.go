@@ -90,12 +90,12 @@ func (r *Retry) retryable(req *http.Request, resp *http.Response, err error) (st
 }
 
 // delay is the wait before attempt n+1: initial each time for fixed, and
-// initial * 2^(n-1) for exponential (capped at 2^16 to avoid overflow).
+// initial * 2^(n-1) for exponential, never more than config.MaxRetryDelay.
 func (r *Retry) delay(n int) time.Duration {
 	if r.backoff != config.BackoffExponential {
 		return r.initial
 	}
-	return r.initial << min(n-1, 16)
+	return min(r.initial<<min(n-1, 16), config.MaxRetryDelay)
 }
 
 // discard drains (a bounded amount of) a response we're about to throw away,

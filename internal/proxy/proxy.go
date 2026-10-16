@@ -62,8 +62,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil && r.Context().Err() == nil {
-		// Headers are already sent, so all we can do is log and cut the response short.
-		h.Logger.Warn("copying upstream response body failed", "path", r.URL.Path, "err", err)
+		h.Logger.Warn("upstream response body failed mid-stream; aborting the client connection", "path", r.URL.Path, "err", err)
+		// The status line is already sent, so the only way left to signal the
+		// failure is to drop the connection. Returning normally would let the
+		// server finish a chunked response cleanly, and a truncated body would
+		// look complete. (httputil.ReverseProxy does the same.)
+		panic(http.ErrAbortHandler)
 	}
 }
 

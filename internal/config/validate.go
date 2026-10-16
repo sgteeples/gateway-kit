@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 )
 
 // Variables that may appear in transform values.
@@ -18,6 +19,16 @@ const (
 )
 
 var knownVariables = []string{VarBody, VarRequestTime, VarResponseTime, VarRoutePath}
+
+// Upper bounds on values that are valid in form but would misbehave at
+// runtime: amplify traffic, spin a CPU, or overflow arithmetic.
+const (
+	MaxRetryAttempts       = 10                     // each attempt is a full upstream call
+	MaxRetryDelay          = 30 * time.Second       // also caps each exponential backoff step
+	MaxTargetWeight        = 1000                   // keeps weighted round robin sums small
+	MaxBreakerThreshold    = 10000                  // bounds the breaker's failure history
+	MinHealthCheckInterval = 100 * time.Millisecond // probes every target each tick
+)
 
 var validMethods = []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"}
 
@@ -105,8 +116,8 @@ func (v *validator) upstream(field string, u *Upstream) {
 	for i, t := range u.Targets {
 		tf := fmt.Sprintf("%s.targets[%d]", field, i)
 		v.upstreamURL(tf+".url", t.URL)
-		if t.Weight < 0 {
-			v.add(tf+".weight", "must not be negative, got %d", t.Weight)
+		if t.Weight < 0 || t.Weight > MaxTargetWeight {
+			v.add(tf+".weight", "must be between 0 and %d, got %d", MaxTargetWeight, t.Weight)
 		}
 	}
 	v.oneOf(field+".balance", u.Balance, BalanceRoundRobin, BalanceWeightedRoundRobin)
@@ -121,11 +132,14 @@ func (v *validator) upstreamURL(field, raw string) {
 }
 
 func (v *validator) retry(field string, r *Retry) {
-	if r.Attempts < 1 {
-		v.add(field+".attempts", "must be at least 1, got %d", r.Attempts)
+	if r.Attempts < 1 || r.Attempts > MaxRetryAttempts {
+		v.add(field+".attempts", "must be between 1 and %d, got %d", MaxRetryAttempts, r.Attempts)
 	}
 	v.oneOf(field+".backoff", r.Backoff, BackoffFixed, BackoffExponential)
 	v.nonNegative(field+".initial_delay", r.InitialDelay)
+	if r.InitialDelay.Std() > MaxRetryDelay {
+		v.add(field+".initial_delay", "must be at most %s", MaxRetryDelay)
+	}
 	for i, code := range r.On {
 		if code < 100 || code > 599 {
 			v.add(fmt.Sprintf("%s.on[%d]", field, i), "not an HTTP status code: %d", code)
@@ -146,7 +160,9 @@ func (v *validator) healthCheck(field string, hc *HealthCheck) {
 	if !strings.HasPrefix(hc.Path, "/") {
 		v.add(field+".path", "must start with \"/\", got %q", hc.Path)
 	}
-	v.positive(field+".interval", hc.Interval)
+	if hc.Interval.Std() < MinHealthCheckInterval {
+		v.add(field+".interval", "must be at least %s", MinHealthCheckInterval)
+	}
 	if hc.UnhealthyThreshold < 0 {
 		v.add(field+".unhealthy_threshold", "must not be negative, got %d", hc.UnhealthyThreshold)
 	}
@@ -156,9 +172,7 @@ func (v *validator) auth(field string, a *Auth) {
 	if a.Type != AuthAPIKey {
 		v.add(field+".type", "must be %q, got %q", AuthAPIKey, a.Type)
 	}
-	if a.Header == "" {
-		v.add(field+".header", "is required")
-	}
+	v.headerName(field+".header", a.Header)
 	if len(a.Keys) == 0 {
 		v.add(field+".keys", "at least one key is required")
 	}
@@ -170,8 +184,8 @@ func (v *validator) auth(field string, a *Auth) {
 }
 
 func (v *validator) circuitBreaker(field string, cb *CircuitBreaker) {
-	if cb.Threshold < 1 {
-		v.add(field+".threshold", "must be at least 1, got %d", cb.Threshold)
+	if cb.Threshold < 1 || cb.Threshold > MaxBreakerThreshold {
+		v.add(field+".threshold", "must be between 1 and %d, got %d", MaxBreakerThreshold, cb.Threshold)
 	}
 	v.positive(field+".window", cb.Window)
 	v.positive(field+".cooldown", cb.Cooldown)
@@ -180,40 +194,72 @@ func (v *validator) circuitBreaker(field string, cb *CircuitBreaker) {
 func (v *validator) transform(field string, t *Transform) {
 	if h := t.Headers; h != nil {
 		for name, value := range h.Add {
-			if name == "" {
-				v.add(field+".headers.add", "header name must not be empty")
+			f := field + ".headers.add." + name
+			v.headerName(f, name)
+			if strings.ContainsAny(value, "\r\n\x00") {
+				v.add(f, "header value must not contain CR, LF or NUL")
 			}
-			v.variable(field+".headers.add."+name, value)
+			v.variable(f, value, false)
 		}
 		for i, name := range h.Remove {
-			if name == "" {
-				v.add(fmt.Sprintf("%s.headers.remove[%d]", field, i), "header name must not be empty")
-			}
+			v.headerName(fmt.Sprintf("%s.headers.remove[%d]", field, i), name)
 		}
 	}
 	if b := t.Body; b != nil {
 		v.mappingConflicts(field+".body.mapping", b.Mapping)
 		for dest, src := range b.Mapping {
-			if dest == "" || src == "" {
-				v.add(field+".body.mapping", "empty key or value in %q: %q", dest, src)
+			f := field + ".body.mapping." + dest
+			if !validDotPath(dest) {
+				v.add(f, "destination must be a dot path like \"user.id\", got %q", dest)
 			}
-			v.variable(field+".body.mapping."+dest, src)
+			if strings.HasPrefix(src, "$") {
+				v.variable(f, src, false)
+			} else if !validDotPath(src) {
+				v.add(f, "source must be a dot path like \"userId\" or a $variable, got %q", src)
+			}
 		}
 		v.envelope(field+".body.envelope", b.Envelope)
 	}
 }
 
-// mappingConflicts rejects destinations where one is a parent of another
-// ("user" and "user.id"): the result would depend on map iteration order.
+// headerName requires an RFC 9110 token. An invalid name would otherwise pass
+// startup and then fail every request on the route with a 502.
+func (v *validator) headerName(field, name string) {
+	if name == "" {
+		v.add(field, "header name is required")
+		return
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		isAlnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+		if !isAlnum && !strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
+			v.add(field, "invalid header name %q", name)
+			return
+		}
+	}
+}
+
+// validDotPath accepts "a" and "a.b.c", rejecting empty segments ("a..b", ".a").
+func validDotPath(p string) bool {
+	return p != "" && !slices.Contains(strings.Split(p, "."), "")
+}
+
+// mappingConflicts rejects a destination that sits inside another one ("user"
+// and "user.id"): the output would depend on map iteration order. Each
+// destination's parents are checked directly, because a sorted-neighbour
+// check misses cases like "user", "user-x", "user.id".
 func (v *validator) mappingConflicts(field string, mapping map[string]string) {
 	dests := make([]string, 0, len(mapping))
 	for dest := range mapping {
 		dests = append(dests, dest)
 	}
-	slices.Sort(dests)
-	for i := 1; i < len(dests); i++ {
-		if strings.HasPrefix(dests[i], dests[i-1]+".") {
-			v.add(field, "destinations %q and %q conflict: one is inside the other", dests[i-1], dests[i])
+	slices.Sort(dests) // stable error order
+	for _, dest := range dests {
+		parts := strings.Split(dest, ".")
+		for i := 1; i < len(parts); i++ {
+			if parent := strings.Join(parts[:i], "."); mapping[parent] != "" {
+				v.add(field, "destinations %q and %q conflict: one is inside the other", parent, dest)
+			}
 		}
 	}
 }
@@ -229,13 +275,18 @@ func (v *validator) envelope(field string, node any) {
 			v.envelope(fmt.Sprintf("%s[%d]", field, i), child)
 		}
 	case string:
-		v.variable(field, n)
+		v.variable(field, n, true)
 	}
 }
 
 // variable rejects "$something" values that aren't a known variable, so a typo
 // like "$request_tme" fails at startup rather than being sent as a literal.
-func (v *validator) variable(field, value string) {
+// "$body" only has a meaning inside an envelope.
+func (v *validator) variable(field, value string, inEnvelope bool) {
+	if value == VarBody && !inEnvelope {
+		v.add(field, "%s is only valid inside a body envelope", VarBody)
+		return
+	}
 	if !strings.HasPrefix(value, "$") || strings.HasPrefix(value, LiteralPrefix) || slices.Contains(knownVariables, value) {
 		return
 	}

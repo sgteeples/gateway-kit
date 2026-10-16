@@ -242,7 +242,7 @@ routes:
     upstream:
       balance: round_robin
       targets: [{url: %q}, {url: %q}]
-    health_check: {path: /healthz, interval: "20ms", unhealthy_threshold: 2}
+    health_check: {path: /healthz, interval: "100ms", unhealthy_threshold: 2}
 `, sickURL, wellURL)
 
 	sick.SetHealthy(false)
@@ -258,8 +258,13 @@ routes:
 
 	sick.SetHealthy(true)
 	eventually(t, func() bool {
-		return decode[mockupstream.Echo](t, h.get("/")).Upstream == "sick" ||
-			decode[mockupstream.Echo](t, h.get("/")).Upstream == "sick"
+		// Round robin alternates, so two requests are enough to reach "sick".
+		for range 2 {
+			if decode[mockupstream.Echo](t, h.get("/")).Upstream == "sick" {
+				return true
+			}
+		}
+		return false
 	})
 }
 

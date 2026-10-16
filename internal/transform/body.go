@@ -148,7 +148,7 @@ func RequestBody(t *config.BodyTransform, routePath string) func(http.Handler) h
 
 			raw, err := io.ReadAll(io.LimitReader(r.Body, netx.MaxBodyBytes+1))
 			if err != nil {
-				httperr.Write(w, &httperr.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "could not read request body", Err: err})
+				httperr.Write(w, netx.BodyReadError(err))
 				return
 			}
 			if len(raw) > netx.MaxBodyBytes {

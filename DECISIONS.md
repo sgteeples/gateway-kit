@@ -55,6 +55,8 @@ client → recover → access log → /health → router (404/405)
 | Which responses get the envelope? | Every upstream response, status kept | 2xx only | Clients get one shape. The gateway's own errors are never wrapped. |
 | Auth or rate limit first? | Auth | Rate limit | Unauthenticated traffic can't use up a `per: global` quota. |
 | Rate-limit key for `per: ip` | TCP peer address | `X-Forwarded-For` | A client can set that header to anything and get a fresh bucket each time. |
+| Unknown config keys? | Reject at startup | Warn and ignore | The YAML must match the schema exactly. Otherwise a typo like `retyr:` would silently disable a feature. |
+| Ambiguous request paths (`;`, `%2F`, `%5C`, control characters) | Reject with 400 | Forward as-is | The router and the upstream must see the same path. Otherwise `/api/internal;x` skips the auth route and a Java upstream serves `/api/internal` anyway. |
 
 Interpretations of the spec's ambiguous parts:
 - **Retries:** `attempts` is the total number of tries. A connection failure counts as 502 and a timeout as 504 when checking the `on` list.
@@ -69,9 +71,15 @@ Interpretations of the spec's ambiguous parts:
   - The circuit breaker trips, and requests then fail fast without reaching the upstream.
   - Retries fail over to another target.
   - Health checks steer traffic away from it.
-- **When the config is malformed:** every problem is reported at startup with its field path, and the gateway exits non-zero. Unknown `$variables` and conflicting mapping paths are caught here too.
+- **When the config is malformed:** every problem is reported at startup with its field path, and the gateway exits non-zero. Validation also rejects values that are valid in form but would break at runtime:
+  - invalid header names, or CR/LF in header values
+  - unknown or misplaced `$variables`
+  - conflicting mapping paths
+  - out-of-range values: `attempts` above 10, `weight` above 1000, a health-check interval under 100ms
 - **When 50 requests arrive at once:** the rate-limit check and the counter update happen under one mutex. Exactly N requests get through, which is tested end to end under `-race`.
 - **When a client disconnects:** the upstream call and any retry waits are cancelled.
+- **When a client is slow:** the request body must arrive within the route timeout, or the client gets 408. The deadline is lifted once the body has arrived, so it never cuts short retries.
+- **When an upstream dies mid-response:** the client connection is aborted rather than finished cleanly, so a truncated body can't pass for a complete one.
 - **Memory stays bounded:**
   - Idle rate-limit buckets are swept.
   - Buffered bodies are capped at 10 MB.
@@ -85,6 +93,12 @@ Interpretations of the spec's ambiguous parts:
 - **Detection delays:** a dead target is only marked unhealthy after `threshold × interval`, which is 90s in the example. Retries and the breaker cover that gap.
 - **Breaker scope:** there is one circuit breaker per route, not per target.
 - **No overall deadline across retries:** `/api/orders` can take up to about 18s in the worst case.
+- **Code-review findings not fixed yet:**
+  - **CONNECT and TRACE:** they are forwarded on routes with no `methods` list; they should get a 405. Go 1.27.2 also patches standard-library HTTP vulnerabilities.
+  - **Failed logins aren't rate limited:** auth runs first, so with `per: ip` key guessing is unthrottled.
+  - **No overall memory limit for buffered bodies:** each one is capped at 10 MB, but nothing limits the total across concurrent requests.
+  - **Logging gaps:** a client that disconnects is logged as 200, and the upstream-failure warning has no request ID.
+  - **Shutdown:** the 15s grace period is shorter than the longest route timeout, and `Close` doesn't wait for background goroutines to finish.
 
 ## What I'd build next
 

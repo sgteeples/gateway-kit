@@ -60,7 +60,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Gateway, error) {
 		routes = append(routes, router.Route{Path: rc.Path, Methods: rc.Methods, Handler: h})
 	}
 
-	g.handler = g.recoverPanics(g.accessLog(g.withHealth(router.New(routes))))
+	g.handler = g.recoverPanics(g.accessLog(g.normalizePath(g.withHealth(router.New(routes)))))
 	return g, nil
 }
 
@@ -144,6 +144,10 @@ func (g *Gateway) buildRoute(rc *config.Route) (http.Handler, error) {
 	if a := rc.Auth; a != nil {
 		h = middleware.APIKey(a.Header, a.Keys)(h)
 	}
+	// Outermost: bound how long the client may take to send its body, so a
+	// slow sender can't hold the request open (the route timeout only starts
+	// with the upstream call).
+	h = middleware.BodyReadTimeout(rc.Upstream.Timeout.Std())(h)
 	return tagRoute(rc.Path, h), nil
 }
 

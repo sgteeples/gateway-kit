@@ -2,6 +2,7 @@
 package netx
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +24,17 @@ func ClientIP(r *http.Request) string {
 	return host
 }
 
+// BodyReadError describes a failure reading the client's request body. A
+// typed error (such as the 408 from a body read timeout) is kept; anything
+// else is a 400.
+func BodyReadError(err error) *httperr.Error {
+	var e *httperr.Error
+	if errors.As(err, &e) {
+		return e
+	}
+	return &httperr.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "could not read request body", Err: err}
+}
+
 // MaxBodyBytes caps any body the gateway has to hold in memory (for retries
 // or body transforms). Streamed bodies are not limited.
 const MaxBodyBytes = 10 << 20
@@ -31,7 +43,7 @@ const MaxBodyBytes = 10 << 20
 func ReadLimited(r io.Reader, limit int64) ([]byte, error) {
 	buf, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
-		return nil, &httperr.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "could not read request body", Err: err}
+		return nil, BodyReadError(err)
 	}
 	if int64(len(buf)) > limit {
 		return nil, &httperr.Error{Status: http.StatusRequestEntityTooLarge, Code: "payload_too_large", Message: fmt.Sprintf("body exceeds %d bytes", limit)}

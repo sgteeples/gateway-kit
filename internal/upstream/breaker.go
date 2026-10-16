@@ -59,7 +59,7 @@ func NewBreaker(cfg config.CircuitBreaker, next http.RoundTripper, logger *slog.
 		next:      next,
 		logger:    logger,
 		now:       time.Now,
-		failures:  make([]time.Time, 0, cfg.Threshold),
+		failures:  make([]time.Time, 0, min(cfg.Threshold, 64)), // grows to threshold only under real failures
 	}
 }
 

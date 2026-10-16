@@ -4,7 +4,13 @@ package middleware
 
 import (
 	"crypto/subtle"
+	"errors"
+	"io"
 	"net/http"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/sgteeples/gateway-kit/internal/config"
 	"github.com/sgteeples/gateway-kit/internal/httperr"
@@ -73,3 +79,84 @@ func keyMatches(got []byte, valid [][]byte) bool {
 	}
 	return match == 1
 }
+
+// errBodyTimeout is returned by a request body whose client stopped sending.
+var errBodyTimeout = &httperr.Error{Status: http.StatusRequestTimeout, Code: "request_timeout", Message: "request body was not received in time"}
+
+// BodyReadTimeout bounds how long a client may take to send its request body.
+//
+// Without it, nothing limits the body: the server only times out reading
+// headers, and the route timeout starts later, when the upstream call does. A
+// client trickling one byte a second would hold the request, its goroutine,
+// and up to MaxBodyBytes of buffer forever (slow-POST DoS).
+//
+// The deadline is cleared once the body has been read, so it never cuts
+// short the upstream call or its retries, which have their own timeouts.
+func BodyReadTimeout(d time.Duration) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Body == nil || r.Body == http.NoBody {
+				next.ServeHTTP(w, r)
+				return
+			}
+			rc := http.NewResponseController(w)
+			if err := rc.SetReadDeadline(time.Now().Add(d)); err != nil {
+				next.ServeHTTP(w, r) // not a real connection (e.g. a test recorder)
+				return
+			}
+			body := &deadlineBody{ReadCloser: r.Body, rc: rc}
+			r.Body = body
+			tw := &writeTracker{ResponseWriter: w}
+			next.ServeHTTP(tw, r)
+
+			// A body read timeout also makes the server cancel the request
+			// context, so whichever layer was reading may have given up
+			// with "context canceled" rather than the 408. Answer it here.
+			if body.timedOut.Load() && !tw.wrote {
+				httperr.Write(w, errBodyTimeout)
+			}
+		})
+	}
+}
+
+type deadlineBody struct {
+	io.ReadCloser
+	rc       *http.ResponseController
+	clear    sync.Once
+	timedOut atomic.Bool
+}
+
+// Read lifts the deadline only once the whole body has arrived. A body that
+// is closed early, or that timed out, keeps it: after the handler returns, the
+// server drains any unread body to reuse the connection, and that drain must
+// stay bounded too, or a slow client would hang it instead.
+func (b *deadlineBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	switch {
+	case err == io.EOF:
+		// The transport may read the body from its own goroutine, hence Once.
+		b.clear.Do(func() { _ = b.rc.SetReadDeadline(time.Time{}) })
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		b.timedOut.Store(true)
+		err = errBodyTimeout
+	}
+	return n, err
+}
+
+// writeTracker records whether a response has been started.
+type writeTracker struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (t *writeTracker) WriteHeader(code int) {
+	t.wrote = true
+	t.ResponseWriter.WriteHeader(code)
+}
+
+func (t *writeTracker) Write(b []byte) (int, error) {
+	t.wrote = true
+	return t.ResponseWriter.Write(b)
+}
+
+func (t *writeTracker) Unwrap() http.ResponseWriter { return t.ResponseWriter }

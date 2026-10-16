@@ -134,3 +134,10 @@ func TestRetryReplaysBody(t *testing.T) {
 		}
 	}
 }
+
+func TestRetryDelayIsCapped(t *testing.T) {
+	r := NewRetry(config.Retry{Attempts: 10, Backoff: config.BackoffExponential, InitialDelay: config.Duration(10 * time.Second)}, nil, discardLogger)
+	if got := r.delay(9); got != config.MaxRetryDelay {
+		t.Errorf("delay(9) = %v, want the %v cap", got, config.MaxRetryDelay)
+	}
+}
